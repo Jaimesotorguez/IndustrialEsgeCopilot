@@ -1,0 +1,50 @@
+# INDUSTRIAL EDGE COPILOT — dependencias backend
+# pip install -r requirements.txt
+
+# ── API y servidor ────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.0
+python-multipart==0.0.9
+
+# ── Configuración ─────────────────────────────────────────
+pyyaml==6.0.2
+python-dotenv==1.0.1
+pydantic==2.8.2
+pydantic-settings==2.4.0
+
+# ── Datos y análisis ──────────────────────────────────────
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.14.0
+
+# ── ML / Detección de anomalías ───────────────────────────
+scikit-learn==1.5.1
+prophet==1.1.5
+joblib==1.4.2
+
+# ── Protocolos industriales ───────────────────────────────
+asyncua==1.1.5          # OPC-UA
+pymodbus==3.7.0         # Modbus TCP
+paho-mqtt==2.1.0        # MQTT
+
+# ── Grafo de proceso ──────────────────────────────────────
+networkx==3.3
+
+# ── Base de datos ─────────────────────────────────────────
+duckdb==1.0.0
+
+# ── Vector store (RAG) ────────────────────────────────────
+chromadb==0.5.5
+
+# ── LLM providers ─────────────────────────────────────────
+anthropic>=0.40.0
+openai==1.45.0
+google-generativeai==0.7.2
+
+# ── Resiliencia ───────────────────────────────────────────
+tenacity==9.0.0
+
+# ── Utilidades ────────────────────────────────────────────
+httpx==0.27.2
+python-dateutil==2.9.0

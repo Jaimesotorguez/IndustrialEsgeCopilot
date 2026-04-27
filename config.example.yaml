@@ -1,0 +1,85 @@
+# INDUSTRIAL EDGE COPILOT — CONFIGURACIÓN
+# Copia este archivo a config.yaml y ajusta los valores
+# NUNCA subas config.yaml a git (está en .gitignore)
+
+# ── LLM ──────────────────────────────────────────────────────────
+llm:
+  provider: claude                    # claude | openai | gemini | ollama
+  model: claude-sonnet-4-6            # Modelo a usar
+  max_tokens: 1000
+  temperature: 0.3                   # Bajo para respuestas más deterministas
+  
+  # API Keys (usar variables de entorno en producción)
+  anthropic_api_key: "sk-ant-..."    # O usar env: ANTHROPIC_API_KEY
+  openai_api_key: ""                 # Solo si provider: openai
+  gemini_api_key: ""                 # Solo si provider: gemini
+  
+  ollama_url: "http://localhost:11434"  # Solo si provider: ollama
+
+# ── FUENTES DE DATOS ──────────────────────────────────────────────
+data_sources:
+  # OPC-UA
+  opcua:
+    enabled: false
+    url: "opc.tcp://localhost:4840"
+    polling_interval_seconds: 5
+  
+  # Modbus TCP
+  modbus:
+    enabled: false
+    host: "192.168.1.100"
+    port: 502
+    polling_interval_seconds: 5
+  
+  # MQTT
+  mqtt:
+    enabled: false
+    broker: "localhost"
+    port: 1883
+    topics: ["factory/+/sensors/#"]
+  
+  # CSV / Historian (para desarrollo con Tennessee Eastman)
+  csv:
+    enabled: true
+    path: "simulator/data/"
+    polling_interval_seconds: 5
+
+# ── BASE DE DATOS ─────────────────────────────────────────────────
+storage:
+  sqlite_path: "data/copilot.db"
+  duckdb_path: "data/analytics.duckdb"
+  chromadb_path: "data/chromadb/"
+  knowledge_graph_path: "data/process_graph.json"
+
+# ── OBSERVACIÓN EN TIEMPO REAL ────────────────────────────────────
+observer:
+  polling_interval_seconds: 5
+  anomaly_threshold: 0.7             # 0-1: sensibilidad del Isolation Forest
+  zscore_window_minutes: 60          # Ventana para Z-score dinámico
+  
+# ── SISTEMA DE ESCALADO ──────────────────────────────────────────
+# Cuándo llamar a Claude API vs procesar localmente
+escalation:
+  min_confidence_for_llm: 0.6        # Solo escala a LLM si anomaly_score > esto
+  max_llm_calls_per_hour: 100        # Límite de seguridad de coste
+  
+# ── LÍMITES DE SEGURIDAD ─────────────────────────────────────────
+# El agente NUNCA propondrá acciones fuera de estos rangos
+# Estos valores los define el ingeniero de planta, no la IA
+safety:
+  require_human_approval: true       # SIEMPRE true en producción
+  max_temperature_delta: 20          # °C máximo que puede cambiar en un comando
+  max_rpm_delta_percent: 30          # % máximo de cambio de RPM
+  emergency_stop_endpoint: "/api/emergency-stop"
+
+# ── CONTEXTO DE PLANTA ────────────────────────────────────────────
+plant:
+  name: "Planta Principal"
+  sector: "alimentacion"             # alimentacion | farmaceutica | automocion | quimica
+  language: "es"                     # Idioma del agente al responder
+
+# ── SERVIDOR ─────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
