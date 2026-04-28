@@ -7,9 +7,9 @@
 
 ## ESTADO ACTUAL
 
-**Fecha:** 26/04/2026
-**Fase:** Backend completo — falta frontend React conectado
-**Siguiente acción inmediata:** Probar arranque con `python start.py`, luego construir frontend React
+**Fecha:** 27/04/2026
+**Fase:** Arquitectura iterativa implementada — pendiente tests y frontend conectado
+**Siguiente acción inmediata:** Probar arranque con `python start.py` + conectar frontend React
 
 ---
 
@@ -24,10 +24,14 @@
 | M2 Normalización | ✅ Hecho | `backend/normalizer/normalizer.py` |
 | M3/M7 Grafo proceso | ✅ Hecho | `backend/process_model/process_graph.py` |
 | M4 Anomaly Detection | ✅ Hecho | `backend/analytics/anomaly_detector.py` |
+| **FeatureExtractor** | ✅ Hecho | `backend/analytics/feature_extractor.py` |
+| **HypothesisEngine** | ✅ Hecho | `backend/inference/hypothesis_engine.py` |
+| **Phase1 Understanding** | ✅ Hecho | `backend/phases/phase1_understand.py` |
+| **Phase2 Learning** | ✅ Hecho | `backend/phases/phase2_learn.py` |
 | M5/M9/M11 Claude LLM | ✅ Hecho | `backend/llm/claude_provider.py` |
 | M6 Interacción | ✅ Hecho | `backend/interaction/interaction_manager.py` |
 | M8 Observer RT | ✅ Hecho | `backend/observer/observer.py` |
-| M9 Reasoning Engine | ✅ Hecho | `backend/analytics/reasoning_engine.py` |
+| M9 Reasoning Engine | ✅ Hecho (refactorizado) | `backend/analytics/reasoning_engine.py` |
 | M10 Recomendación | ✅ Hecho | `backend/recommender/recommender.py` |
 | M12 Memoria SQLite | ✅ Hecho | `backend/memory/memory_store.py` |
 | M13 Validación | ✅ Hecho | `backend/validator/safety_validator.py` |
@@ -39,6 +43,48 @@
 | Mockup dashboard HTML | ✅ Hecho | `docs/mockup/dashboard.html` |
 | Frontend React real | ⬜ Por hacer | `frontend/` |
 | Tests unitarios | ⬜ Por hacer | `tests/` |
+| OpenAI/Gemini/Ollama providers | ⬜ Por hacer | `backend/llm/` |
+| MQTT adapter | ⬜ Por hacer | `backend/adapters/mqtt_adapter.py` |
+
+---
+
+## ARQUITECTURA ITERATIVA (nueva — 3 fases)
+
+### Fase 1 — Entendimiento del proceso (OFFLINE, una vez)
+```bash
+python -m backend.phases.phase1_understand simulator/data/tep_normal.csv
+# Output: data/process_understanding.json
+# - Clasifica variables por tipo (temperatura, presión, RPM...)
+# - Detecta modos de operación (nominal, arranque, parada)
+# - Agrupa variables por equipo (correlación > 0.80)
+# - Con LLM: identifica tipo de proceso industrial
+```
+
+### Fase 2 — Aprendizaje profundo del histórico (OFFLINE, periódico)
+```bash
+python -m backend.phases.phase2_learn simulator/data/tep_normal.csv
+# Output: data/learned_model.json
+# - Baselines robustos por variable (media, std, percentiles, IQR)
+# - Correlaciones validadas estadísticamente (p < 0.01)
+# - Lags causales con cross-correlación (hasta 20 muestras)
+# - Hipótesis recurrentes en ventanas históricas
+# - Grafo de proceso con confianza estadística
+```
+
+### Fase 3 — Observación en tiempo real (ONLINE, continuo)
+```
+RealtimeObserver → AnomalyEvent
+  → FeatureExtractor (€0) → features estructuradas
+  → HypothesisEngine: genera hipótesis (LLM) → testa con Python (€0) → itera
+  → Diagnosis con evidencia estadística
+  → ActionRecommender → RecommendedAction (pendiente aprobación humana)
+```
+
+### Motor de hipótesis standalone
+```bash
+python -m backend.inference.hypothesis_engine simulator/data/tep_normal.csv
+# Testa el bucle generar→evaluar→clasificar sin el sistema completo
+```
 
 ---
 
@@ -52,54 +98,14 @@ cd backend && pip install -r requirements.txt && cd ..
 cp config.example.yaml config.yaml
 # Editar config.yaml → añadir anthropic_api_key
 
-# 3. Arrancar
+# 3. (Opcional) Fase offline antes de arrancar en RT
+python -m backend.phases.phase1_understand simulator/data/tep_normal.csv
+python -m backend.phases.phase2_learn simulator/data/tep_normal.csv
+
+# 4. Arrancar
 python start.py
-
-# El sistema:
-# - Genera datos TEP automáticamente si no existen
-# - Entrena Isolation Forest sobre el histórico
-# - Aprende grafo de proceso
-# - Arranca en http://localhost:8000
-# - API docs en http://localhost:8000/docs
-```
-
----
-
-## ARQUITECTURA DEL SISTEMA (cómo se conecta todo)
-
-```
-start.py
-  └── AppContainer.build() + start()
-        ├── M12 SqliteMemoryStore       (data/copilot.db)
-        ├── M13 SafetyValidatorImpl     (config/safety_limits.json)
-        ├── M3/M7 ProcessGraph          (data/process_graph.json)
-        ├── LLM ClaudeProvider          (Claude API)
-        ├── M1 IngestionManager
-        │     └── CsvAdapter            (simulator/data/)
-        │     └── OpcUaAdapter          (si habilitado en config)
-        │     └── ModbusAdapter         (si habilitado en config)
-        ├── M2 SensorNormalizer
-        ├── M4 IsolationForestDetector  (data/anomaly_model.joblib)
-        ├── M9 ReasoningEngine          (usa LLM + ProcessGraph + Memory)
-        ├── M10 ActionRecommenderImpl   (usa LLM + Validator + Memory)
-        ├── M6 InteractionManager       (usa ProcessGraph + LLM)
-        └── M8 RealtimeObserver         (bucle principal)
-              ↓ on_anomaly()
-              AppContainer._handle_anomaly()
-                ├── M9.diagnose() → Claude API
-                ├── M10.recommend() → acción pendiente
-                └── M6.generate_question() → si confianza < 0.75
-
-FastAPI (api/main.py)
-  ├── WebSocket /ws → broadcast de eventos en RT
-  ├── GET  /api/status
-  ├── GET  /api/readings
-  ├── GET  /api/events
-  ├── GET/POST /api/commands
-  ├── POST /api/emergency-stop
-  ├── POST /api/chat
-  ├── GET  /api/process-model
-  └── GET  /api/history
+# http://localhost:8000
+# http://localhost:8000/docs
 ```
 
 ---
@@ -107,21 +113,23 @@ FastAPI (api/main.py)
 ## PENDIENTE — PRÓXIMAS SESIONES
 
 ### Prioritario
-- [ ] Probar arranque completo y corregir errores
+- [ ] Probar arranque completo (`python start.py`) y corregir errores de integración
+- [ ] Cargar `learned_model.json` en Observer y ReasoningEngine al arrancar
 - [ ] Frontend React con WebSocket conectado al backend
   - Componente Monitor (reemplaza mockup HTML)
   - Componente Chat conectado a /api/chat
   - Componente Comandos con aprobación real
   - Componente Modelo de Proceso (grafo visual)
+- [ ] Tests unitarios por módulo (pytest + datos sintéticos)
 
-### Mejoras backend (fase 2)
-- [ ] Tests unitarios por módulo (usar pytest + datos sintéticos)
-- [ ] OpenAI provider (llm/openai_provider.py)
-- [ ] Gemini provider (llm/gemini_provider.py)
+### Mejoras backend
+- [ ] OpenAI provider (`backend/llm/openai_provider.py`)
+- [ ] Gemini provider (`backend/llm/gemini_provider.py`)
 - [ ] Ollama provider para uso local gratis
-- [ ] DuckDB para analytics histórico (M12 avanzado)
-- [ ] ChromaDB para RAG semántico (mejora M9)
+- [ ] DuckDB para analytics histórico
+- [ ] ChromaDB para RAG semántico
 - [ ] MQTT adapter
+- [ ] Endpoint API para lanzar Phase1/Phase2 desde el frontend
 
 ---
 
@@ -132,9 +140,13 @@ FastAPI (api/main.py)
 | 26/04/2026 | AppContainer como único punto de cableado | Evita acoplamiento entre módulos, facilita testing |
 | 26/04/2026 | SQLite sin servidor para MVP | Zero-config, funciona en Raspberry Pi, migración trivial |
 | 26/04/2026 | Isolation Forest para anomalías | No supervisado, rápido, explicable, robusto con datos industriales |
-| 26/04/2026 | Contexto comprimido en Claude: max 12 tags, 3 eventos pasados | Control de coste: ~€15-30/mes por fábrica |
+| 26/04/2026 | Contexto comprimido en Claude: max 15 vars via FeatureExtractor | Control de coste: ~€15-30/mes por fábrica |
 | 26/04/2026 | LLM agnóstico via factory | Cambiar de Claude a GPT = 1 línea en config.yaml |
 | 26/04/2026 | Validación de seguridad en dos puntos: al proponer Y al ejecutar | Doble seguridad para acciones críticas |
+| 27/04/2026 | HypothesisEngine iterativo en lugar de one-shot LLM | Diagnóstico con evidencia estadística verificable, no inventado |
+| 27/04/2026 | FeatureExtractor como capa entre datos y LLM | LLM nunca recibe datos crudos; solo features comprimidas (€0) |
+| 27/04/2026 | Fases 1 y 2 offline e independientemente testeables | Módulo a módulo, sin necesidad de datos RT para desarrollar |
+| 27/04/2026 | Hipótesis heurísticas como fallback sin LLM | Sistema funciona sin API key; LLM solo mejora la semántica |
 
 ---
 

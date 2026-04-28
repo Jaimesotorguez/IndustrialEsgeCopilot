@@ -3,17 +3,17 @@ analytics/reasoning_engine.py — M9: Razonamiento operativo
 ===========================================================
 Orquesta el diagnóstico completo cuando se detecta una anomalía.
 
-Flujo completo M9:
+Flujo M9 (nuevo — iterativo):
 1. Recibe AnomalyEvent del Observer (M8)
-2. Comprime el contexto: subgrafo relevante + eventos similares (RAG)
-3. Llama a Claude API con contexto comprimido
-4. Retorna Diagnosis estructurado
-5. Pasa el diagnóstico al Recommender (M10)
+2. FeatureExtractor convierte datos actuales en features estructuradas (€0)
+3. HypothesisEngine itera: genera hipótesis (LLM) → testa con Python (€0) → acepta/rechaza
+4. Si no converge, genera pregunta para el operario
+5. Retorna Diagnosis estructurado con evidencia
 
-La clave del coste controlado:
-- Solo se llama cuando hay anomalía con score > threshold (M8 ya filtró)
-- El contexto se comprime: nunca más de ~2000 tokens de entrada
-- El subgrafo limita qué variables se incluyen
+Control de coste:
+- FeatureExtractor: €0 (Python puro)
+- HypothesisEngine: 1 llamada LLM por iteración (típicamente 1-2)
+- Contexto comprimido: máximo top_n=15 variables al LLM
 """
 
 import uuid
@@ -22,12 +22,14 @@ from typing import Optional
 
 from backend.core.interfaces import AnomalyEvent, Diagnosis, Severity
 from backend.core.config import get_settings
+from backend.analytics.feature_extractor import FeatureExtractor
+from backend.inference.hypothesis_engine import HypothesisEngine, InferenceResult
 
 
 class ReasoningEngine:
     """
     Motor de razonamiento operativo.
-    Conecta detección de anomalías → diagnóstico Claude → recomendación.
+    Conecta detección de anomalías → FeatureExtractor → HypothesisEngine → Diagnosis.
     """
 
     def __init__(
@@ -41,66 +43,101 @@ class ReasoningEngine:
         self._graph = process_graph
         self._memory = memory
         self._normalizer = normalizer
+        self._extractor = FeatureExtractor()
+        self._engine = HypothesisEngine(llm=llm, process_graph=process_graph)
         self._diagnosis_count = 0
 
     async def diagnose(self, event: AnomalyEvent) -> Optional[Diagnosis]:
         """
         Genera un diagnóstico completo para un evento de anomalía.
-        Retorna None si no hay LLM configurado o el score es muy bajo.
+        Retorna None si el score es demasiado bajo.
         """
         cfg = get_settings()
         if event.anomaly_score < cfg.escalation.min_confidence_for_llm:
             return None
 
-        if not self._llm:
-            return self._simple_diagnosis(event)
-
         try:
-            # ── Compresión de contexto (clave para control de coste) ──────────
-            relevant_tags = self._get_relevant_tags(event.tag_ids)
-            baselines = self._get_baselines(relevant_tags)
-            similar_events = self._get_similar_events(event.tag_ids)
-            plant_config = {
-                "sector": cfg.plant.sector,
-                "language": cfg.plant.language,
-                "name": cfg.plant.name,
-            }
+            # ── 1. Recupera datos recientes para feature extraction ────────────
+            df_current = self._get_recent_dataframe(event.tag_ids)
+            baselines = self._get_baselines(event.tag_ids)
 
-            # ── Llamada a Claude API ──────────────────────────────────────────
-            result = await self._llm.diagnose(
-                anomaly_description=event.description,
-                relevant_tags=relevant_tags[:8],      # Máximo 8 variables
-                tag_values=event.raw_values,
-                tag_baselines=baselines,
-                similar_past_events=similar_events[:3],  # Máximo 3 eventos pasados
-                plant_config=plant_config,
-            )
+            # ── 2. Extrae features estructuradas (€0) ─────────────────────────
+            features = {}
+            if df_current is not None and not df_current.empty:
+                features = self._extractor.extract(
+                    df_current, baselines=baselines, top_n=15
+                )
 
-            if not result:
+            if not features:
                 return self._simple_diagnosis(event)
 
-            # ── Construye objeto Diagnosis ────────────────────────────────────
+            # ── 3. Motor iterativo de hipótesis ───────────────────────────────
+            context = {
+                "anomaly_description": event.description,
+                "severity": event.severity.value,
+                "anomaly_score": event.anomaly_score,
+                "plant": cfg.plant.name,
+                "sector": cfg.plant.sector,
+                "similar_events": self._get_similar_events(event.tag_ids),
+            }
+
+            inference: InferenceResult = await self._engine.run(
+                features=features,
+                df_current=df_current,
+                context=context,
+                max_iterations=3,
+            )
+
+            # ── 4. Construye Diagnosis desde InferenceResult ───────────────────
+            if inference.accepted:
+                top = max(inference.accepted, key=lambda h: h.score)
+                cause = top.hypothesis
+                confidence = top.score
+                evidence = top.evidence_for
+            else:
+                cause = inference.summary
+                confidence = event.anomaly_score * 0.6   # Reducida por incertidumbre
+                evidence = [event.description]
+
+            tags_involved = list(
+                set(event.tag_ids)
+                | set(
+                    tag
+                    for h in inference.accepted
+                    for tag in features.get("variables", {}).keys()
+                    if tag.lower() in h.hypothesis.lower()
+                )
+            )
+
             diagnosis = Diagnosis(
                 id=str(uuid.uuid4()),
                 timestamp=datetime.now(),
-                probable_cause=result.get("causa_probable", event.description),
-                confidence=float(result.get("confianza", event.anomaly_score)),
-                tags_involved=result.get("variables_implicadas", event.tag_ids),
-                urgency=int(result.get("urgencia", self._score_to_urgency(event.anomaly_score))),
-                evidence=result.get("evidencia", []),
-                context_sent_tokens=0,  # Se actualiza desde el provider
+                probable_cause=cause,
+                confidence=round(confidence, 3),
+                tags_involved=tags_involved[:10],
+                urgency=self._score_to_urgency(event.anomaly_score),
+                evidence=evidence[:5],
+                context_sent_tokens=inference.tokens_used,
             )
 
-            # Persiste en memoria
+            # Adjunta pregunta para operario si la hay
+            if inference.question_for_operator:
+                diagnosis.evidence.append(
+                    f"[PREGUNTA AL OPERARIO] {inference.question_for_operator}"
+                )
+
+            # ── 5. Persiste en memoria ────────────────────────────────────────
             if self._memory:
                 event_id = self._memory.save_event(event)
                 self._memory.save_diagnosis(diagnosis, event_id=event_id)
 
             self._diagnosis_count += 1
             print(
-                f"[Reasoning] Diagnóstico #{self._diagnosis_count}: "
-                f"'{diagnosis.probable_cause[:60]}...' "
-                f"confianza={diagnosis.confidence:.2f} urgencia={diagnosis.urgency}/5"
+                f"[Reasoning] #{self._diagnosis_count}: "
+                f"'{diagnosis.probable_cause[:60]}' "
+                f"conf={diagnosis.confidence:.2f} "
+                f"iters={inference.n_iterations} "
+                f"tokens={inference.tokens_used}"
             )
             return diagnosis
 
@@ -108,39 +145,37 @@ class ReasoningEngine:
             print(f"[Reasoning] Error en diagnóstico: {e}")
             return self._simple_diagnosis(event)
 
-    # ── Compresión de contexto ────────────────────────────────────────────────
+    # ── Recuperación de datos actuales ────────────────────────────────────────
 
-    def _get_relevant_tags(self, tag_ids: list[str]) -> list[str]:
+    def _get_recent_dataframe(self, tag_ids: list[str]):
         """
-        Obtiene tags relacionados del grafo de proceso.
-        Esto es lo que limita el contexto enviado a Claude.
+        Intenta recuperar un DataFrame de los datos más recientes.
+        Fuente: normalizer si tiene buffer, o None.
         """
-        if not self._graph:
-            return tag_ids
-
-        all_relevant = set(tag_ids)
-        for tag in tag_ids[:3]:  # Expande desde los 3 tags principales
-            related = self._graph.get_related_tags(tag, max_hops=1)
-            all_relevant.update(related[:5])  # Máximo 5 relacionados por tag
-
-        return list(all_relevant)[:12]  # Tope absoluto de 12 tags en contexto
+        if not self._normalizer:
+            return None
+        try:
+            if hasattr(self._normalizer, "get_recent_dataframe"):
+                return self._normalizer.get_recent_dataframe(n=100)
+        except Exception:
+            pass
+        return None
 
     def _get_baselines(self, tag_ids: list[str]) -> dict:
-        """Obtiene estadísticas de baseline para los tags relevantes."""
-        if not self._normalizer or not hasattr(self._normalizer, 'get_baseline'):
+        if not self._normalizer or not hasattr(self._normalizer, "get_baseline"):
             return {}
-        return {
-            tag: self._normalizer.get_baseline(tag)
-            for tag in tag_ids
-            if self._normalizer.get_baseline(tag)
-        }
+        baselines = {}
+        for tag in tag_ids:
+            b = self._normalizer.get_baseline(tag)
+            if b:
+                baselines[tag] = b
+        return baselines
 
     def _get_similar_events(self, tag_ids: list[str]) -> list[dict]:
-        """RAG: recupera eventos similares del pasado para dar contexto."""
         if not self._memory:
             return []
         try:
-            past_events = self._memory.get_similar_events(tag_ids, limit=3)
+            past = self._memory.get_similar_events(tag_ids, limit=3)
             return [
                 {
                     "descripcion": e.description,
@@ -148,7 +183,7 @@ class ReasoningEngine:
                     "score": e.anomaly_score,
                     "cuando": e.timestamp.isoformat(),
                 }
-                for e in past_events
+                for e in past
             ]
         except Exception:
             return []
@@ -156,14 +191,13 @@ class ReasoningEngine:
     # ── Diagnóstico simple sin LLM ────────────────────────────────────────────
 
     def _simple_diagnosis(self, event: AnomalyEvent) -> Diagnosis:
-        """
-        Diagnóstico básico sin LLM.
-        Se usa cuando no hay API key o el score es bajo.
-        """
         return Diagnosis(
             id=str(uuid.uuid4()),
             timestamp=datetime.now(),
-            probable_cause=f"Anomalía detectada en {', '.join(event.tag_ids[:3])}. Score: {event.anomaly_score:.2f}",
+            probable_cause=(
+                f"Anomalía detectada en {', '.join(event.tag_ids[:3])}. "
+                f"Score: {event.anomaly_score:.2f}"
+            ),
             confidence=event.anomaly_score,
             tags_involved=event.tag_ids,
             urgency=self._score_to_urgency(event.anomaly_score),
@@ -179,4 +213,7 @@ class ReasoningEngine:
         return 1
 
     def get_stats(self) -> dict:
-        return {"total_diagnoses": self._diagnosis_count}
+        return {
+            "total_diagnoses": self._diagnosis_count,
+            "validated_hypotheses": len(self._engine.get_validated_history()),
+        }
